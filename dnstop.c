@@ -82,6 +82,34 @@ typedef struct {
 }      AgentAddr;
 
 typedef struct {
+    inX_addr addr;       // source IP
+    unsigned int noerror;
+    unsigned int nxdomain;
+    unsigned int servfail;
+    unsigned int last_total;   // total responses counted at last interval
+    struct timeval last_ts;  // timestamp of last count
+
+    // For QPS tracking
+    unsigned int last_noerror;
+    unsigned int last_nxdomain;
+    unsigned int last_servfail;
+
+    // Maximum QPS seen so far
+    unsigned int max_qps_noerror;
+    unsigned int max_qps_nxdomain;
+    unsigned int max_qps_servfail;
+
+    // Timestamp when first seen
+    struct timeval first_seen_ts;
+    // Timestamp when last activity was observed (for active_seconds)
+    struct timeval last_active_ts;
+    // Total seconds with activity
+    double active_seconds;
+} SourceBehavior;
+
+hashtbl *SourceBehaviors = NULL;
+
+typedef struct {
     char *s;
     int count;
 }      StringCounter;
@@ -98,9 +126,14 @@ typedef struct {
 }      StringAddrCounter;
 
 typedef struct {
-    int cnt;
-    void *ptr;
-}      SortItem;
+    unsigned int cnt;            // sorting key (total QPS)
+    void *ptr;                   // pointer to SourceBehavior
+
+    // QPS values stored for printing
+    unsigned int qps_noerror;
+    unsigned int qps_nxdomain;
+    unsigned int qps_servfail;
+} SortItem;
 
 typedef struct _rfc1035_header rfc1035_header;
 struct _rfc1035_header {
@@ -379,6 +412,18 @@ AgentAddr_lookup_or_add(hashtbl * tbl, const inX_addr * addr)
     return x;
 }
 
+SourceBehavior *SourceBehavior_lookup_or_add(const inX_addr *addr) {
+    SourceBehavior *sb = hash_find(addr, SourceBehaviors);
+    if (!sb) {
+        sb = calloc(1, sizeof(*sb));
+        sb->addr = *addr;
+        hash_add(&sb->addr, sb, SourceBehaviors);
+        gettimeofday(&sb->first_seen_ts, NULL);
+        sb->last_active_ts = sb->first_seen_ts;
+        sb->active_seconds = 0.0;
+    }
+    return sb;
+}
 
 static unsigned int
 string_hash(const void *s)
@@ -638,6 +683,16 @@ handle_dns(const char *buf, int len,
         if ((agent = AgentAddr_lookup_or_add(Destinations, dst_addr)) != NULL)
 	    agent->count++;
     }
+	if (1 == qh.qr) {  // DNS reply
+    SourceBehavior *sb = SourceBehavior_lookup_or_add(dst_addr);
+    switch(qh.rcode) {
+        case 0: sb->noerror++; break;
+        case 2: sb->servfail++; break;
+        case 3: sb->nxdomain++; break;
+        default: break;
+    }
+}
+
     if (0 == opt_count_queries || 0 == qh.qr) {
 	qtype_counts[qtype]++;
 	qclass_counts[qclass]++;
@@ -948,6 +1003,98 @@ redraw()
     cron_post();
     do_redraw = 0;
 }
+void SourceBehavior_report(void) {
+    int count = hash_count(SourceBehaviors);
+    SortItem *sorted = calloc(count, sizeof(SortItem));
+    SourceBehavior *sb;
+    int idx = 0;
+
+    struct timeval now;
+    gettimeofday(&now, NULL);
+
+    // First pass: compute QPS and store in sorted[idx].qps_xxx
+    hash_iter_init(SourceBehaviors);
+    while ((sb = hash_iterate(SourceBehaviors))) {
+
+        double interval = (now.tv_sec - sb->last_ts.tv_sec) +
+                          (now.tv_usec - sb->last_ts.tv_usec) / 1000000.0;
+        if (interval <= 0.0)
+            interval = 1.0;
+
+        // compute QPS correctly
+        unsigned int qps_noerror  = (sb->noerror  - sb->last_noerror)  / interval;
+        unsigned int qps_nxdomain = (sb->nxdomain - sb->last_nxdomain) / interval;
+        unsigned int qps_servfail = (sb->servfail - sb->last_servfail) / interval;
+
+        // update maximums if higher
+        if (qps_noerror > sb->max_qps_noerror)
+            sb->max_qps_noerror = qps_noerror;
+        if (qps_nxdomain > sb->max_qps_nxdomain)
+            sb->max_qps_nxdomain = qps_nxdomain;
+        if (qps_servfail > sb->max_qps_servfail)
+            sb->max_qps_servfail = qps_servfail;
+
+        // store for sorting
+        sorted[idx].cnt = qps_noerror + qps_nxdomain + qps_servfail; // sort key
+        sorted[idx].ptr = sb;
+
+        // store QPS inside the SortItem temporarily
+        sorted[idx].qps_noerror  = qps_noerror;
+        sorted[idx].qps_nxdomain = qps_nxdomain;
+        sorted[idx].qps_servfail = qps_servfail;
+
+        idx++;
+    }
+
+    // Sort by total QPS descending
+    qsort(sorted, idx, sizeof(SortItem), SortItem_cmp);
+
+    // Print header
+    print_func("%-15s %12s %12s %12s %12s\n",
+        "Client IP",
+        "NOERROR_QPS",
+        "NXDOMAIN_QPS",
+        "SERVFAIL_QPS",
+        "Seconds"
+    );
+
+    // Print sorted results
+    for (int i = 0; i < idx; i++) {
+        sb = sorted[i].ptr;
+        unsigned int new_activity = (sb->noerror - sb->last_noerror) +
+                                    (sb->nxdomain - sb->last_nxdomain) +
+                                    (sb->servfail - sb->last_servfail);
+        double delta_time = 0.0;
+        if (new_activity > 0) {
+            delta_time = (now.tv_sec - sb->last_active_ts.tv_sec) +
+                         (now.tv_usec - sb->last_active_ts.tv_usec) / 1000000.0;
+            if (delta_time < 0.0)
+                delta_time = 0.0;
+            sb->active_seconds += delta_time;
+            sb->last_active_ts = now;
+        }
+        double duration = sb->active_seconds;
+        print_func("%-15s %12u %12u %12u %12.1f\n",
+            anon_inet_ntoa(&sb->addr),
+            sb->max_qps_noerror,
+            sb->max_qps_nxdomain,
+            sb->max_qps_servfail,
+            duration
+        );
+    }
+
+    // Second pass: update snapshots AFTER printing
+    hash_iter_init(SourceBehaviors);
+    while ((sb = hash_iterate(SourceBehaviors))) {
+        sb->last_noerror  = sb->noerror;
+        sb->last_nxdomain = sb->nxdomain;
+        sb->last_servfail = sb->servfail;
+        sb->last_ts = now;
+    }
+
+    free(sorted);
+}
+
 
 void
 keyboard(void)
@@ -962,6 +1109,9 @@ keyboard(void)
     if (ch >= 'A' && ch <= 'Z')
 	ch += 'a' - 'A';
     switch (ch) {
+	case 'i':
+    SubReport = SourceBehavior_report;
+    break;
     case 's':
 	SubReport = Sources_report;
 	break;
@@ -1570,8 +1720,9 @@ report(void)
     }
     if (opt_count_replies) {
 	move(Y, 0);
-	print_func("Replies: %u new, %u total",
-	    reply_count_intvl, reply_count_total);
+	unsigned int total_ips = hash_count(SourceBehaviors);
+	print_func("Replies: %u QPS, Total IP: %u",
+	    reply_count_intvl, total_ips);
 	if (Got_EOF)
 	    print_func(", EOF");
 	clrtoeol();
@@ -1801,6 +1952,12 @@ ResetCounters(void)
 	Sources = hash_create(hash_buckets, my_inXaddr_hash, my_inXaddr_cmp);
     if (NULL == Destinations)
 	Destinations = hash_create(hash_buckets, my_inXaddr_hash, my_inXaddr_cmp);
+
+	if (NULL == SourceBehaviors)
+    	SourceBehaviors = hash_create(hash_buckets, my_inXaddr_hash, my_inXaddr_cmp);
+	else
+    	hash_free(SourceBehaviors, free);
+
     for (lvl = 1; lvl <= max_level; lvl++) {
 	if (NULL != Domains[lvl])
 	    continue;
@@ -1824,7 +1981,20 @@ ResetCounters(void)
 	    hash_free(DomSrcs[lvl], StringAddrCounter_free);
     }
     memset(&last_ts, '\0', sizeof(last_ts));
+
+	//added code fore reseting counters
+	struct timeval now;
+	gettimeofday(&now, NULL);
+	hash_iter_init(SourceBehaviors);
+	SourceBehavior *sb;
+	while ((sb = hash_iterate(SourceBehaviors))) {
+    	sb->last_total = 0;
+    	sb->last_ts = now;
+        sb->active_seconds = 0.0;
+	}
 }
+
+
 
 void
 usage(void)
